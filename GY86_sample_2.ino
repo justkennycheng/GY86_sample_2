@@ -4,7 +4,6 @@
 
 // ---------------------------
 // 硬件 & DMP 相关
-// ---------------------------
 MPU6050 mpu;
 
 bool dmpReady = false;      // DMP 是否初始化成功
@@ -14,11 +13,9 @@ uint16_t packetSize;        // 每个 DMP 包的字节数
 uint16_t fifoCount;         // FIFO 当前字节数
 uint8_t fifoBuffer[64];     // FIFO 缓冲区
 
-bool easymode_enable = ture;   //默认开启PID外环
+bool easymode_enable = true;   //默认开启PID外环
 
-// ---------------------------
 // 姿态相关（四元数 + YPR）
-// ---------------------------
 Quaternion q_current;               // 当前姿态四元数
 Quaternion q_target;               //  目标姿态四元数
 VectorFloat gravity;        // 重力向量
@@ -27,11 +24,27 @@ float ypr[3];               // yaw, pitch, roll（单位：弧度）
 //陀螺仪数据
 int16_t gx_raw, gy_raw, gz_raw;
 
-// ----------- PID 状态变量 -----------
+// ----------- PID 状态存储变量 -----------
 float roll_i = 0.0f; float roll_last = 0.0f;
 float pitch_i = 0.0f; float pitch_last = 0.0f;
 float yaw_i = 0.0f; float yaw_last = 0.0f;
 
+
+//最大姿态角（可调）
+float max_roll  = 40.0f * 0.0174533f;   //转换为 rad
+float max_pitch = 40.0f * 0.0174533f;   //转换为 rad
+
+//油门摇杆输入//1200-1800
+float rc_thr = 1500.0;     
+//摇杆输入//-1至1 
+float rc_roll = 0.0;   // 左右
+float rc_pitch =  0.0;  // 前后
+float rc_yaw =  0.0;    // 偏航
+
+
+////////////////////////////////////////////////////
+////////////////////////////////////////////////////
+////////////////////////////////////////////////////
 
 void setup() {
     Serial.begin(115200);
@@ -72,6 +85,9 @@ void setup() {
         Serial.print(devStatus);
         Serial.println(")");
     }
+
+
+
 }
 
 void loop() {
@@ -80,7 +96,8 @@ void loop() {
     uint32_t now_t = micros();
     float dt = (now_t - last_t) * 1e-6f;    // 转换成秒
     last_t = now_t;
-
+    
+    /////////////获得四元数和陀螺仪角速度/////////////////
     if (!dmpReady) return;
     // 检查 FIFO 中是否有完整包
     fifoCount = mpu.getFIFOCount();
@@ -100,7 +117,6 @@ void loop() {
     mpu.dmpGetQuaternion(&q_current, fifoBuffer);
     mpu.dmpGetGravity(&gravity, &q_current);
     mpu.dmpGetYawPitchRoll(ypr, &q_current, &gravity);
-
     // ypr[0] = yaw, ypr[1] = pitch, ypr[2] = roll（单位：弧度）
     float yaw   = rad2deg(ypr[0]);
     float pitch = rad2deg(ypr[1]);
@@ -117,87 +133,83 @@ void loop() {
     gy *= 0.0174533f;
     gz *= 0.0174533f;
 
+    ///////////根据摇杆输入构造q_target///////////////////////////
     //摇杆输入转四元数
-    // 1. 摇杆输入（-1.0 ~ +1.0）
-    float rc_roll;   // 左右
-    float rc_pitch;  // 前后
-    float rc_yaw;    // 偏航
-    // 2. 最大姿态角（你可以调）
-    float max_roll  = 30.0f * 0.0174533f;   //转换为 rad/s
-    float max_pitch = 30.0f * 0.0174533f;   //转换为 rad/s
-    // 3. roll/pitch 目标角度
-    float roll_target  = rc_roll  * max_roll;
-    float pitch_target = rc_pitch * max_pitch;
-    // 4. yaw 是累积角度（航向锁定）
+    //roll/pitch 目标角度
+    float roll_target  = rc_roll  * max_roll;   //摇杆输入（-1.0 ~ +1.0）转为角度(rad)
+    float pitch_target = rc_pitch * max_pitch;  //摇杆输入（-1.0 ~ +1.0）转为角度(rad)
+    //yaw 是累积角度（航向锁定）
     static float yaw_target = 0.0f;
     yaw_target += rc_yaw * 0.02f;   // 每次循环累积一点
-    // 5. 欧拉角 → 四元数
-    q_target = eulerToQuaternion( roll_target, pitch_target, yaw_target );
+    //欧拉角 → 四元数
+    q_target = eulerToQuaternion(roll_target, pitch_target, yaw_target);
 
-
-    // q_current 来自 DMP
-    // q_target 由你的模式决定（例如水平 = (1,0,0,0)）
-    // gx,gy,gz 来自陀螺仪（注意单位统一）
-    // dt 是循环时间
+    ///////////进行PID计算得到姿态控制输出////////////////////////
     float u_roll, u_pitch, u_yaw;
-    attitudeControlStep(q_target, q_current, gx, gy, gz, dt, u_roll, u_pitch, u_yaw);
+    attitudeControlStep(q_target, q_current, gx, gy, gz, dt, u_roll, u_pitch, u_yaw);   //得到姿态控制输出u_roll, u_pitch, u_yaw
 
-    // 这里先不做 motorMix，等你准备好了我们再接下去
-
-
+    //电机混控motorMix
+    float m1, m2, m3, m4;
+    motorMix(rc_thr, u_roll, u_pitch, u_yaw, m1, m2, m3, m4);     //m输出范围1000-2000
 
     //打印部分
-    // ---------------------------
-    // 航空航天右手坐标系约定：
-    //  - roll > 0  : 右滚（右机翼下沉）
-    //  - pitch > 0 : 机头抬起（nose up）
-    //  - yaw > 0   : 机头向右偏航
-    // Jeff Rowberg 的 dmpGetYawPitchRoll 本身就是这个约定
-    // ---------------------------
-    Serial.printf("dt=%.4fs  YAW=%.2fdeg  PITCH=%.2fdeg  ROLL=%.2fdeg  GX=%.2frad/s  GY=%.2frad/s  GZ=%.2frad/s\n",
-              dt, yaw, pitch, roll, gx, gy, gz);
-    // 这里你可以直接把 roll/pitch/yaw 喂给姿态 PID
-    // 注意：控制时用“角度误差（圆上最短差）”，不要直接相减
+    //定期执行
+    static uint32_t lastTick = 0;
+    if (millis() - lastTick > 10) {
+        Serial.printf("dt=%.4fs  YAW=%.2fdeg  PITCH=%.2fdeg  ROLL=%.2fdeg  gx=%.2frad/s  gy=%.2frad/s  gz=%.2frad/s  m1=%.1f m1=%.1f m1=%.1f m1=%.1f\n",
+              dt, yaw, pitch, roll, gx, gy, gz, m1, m2, m3, m4);
+        lastTick = millis();
+    }
+    
+
 
 }
 
 ////////////////////////////////////////////////////
+//////////////////FUNCTION//////////////////////////
 ////////////////////////////////////////////////////
-////////////////////////////////////////////////////
-
 // ---------------------------
 // 工具函数：弧度转角度
-// ---------------------------
 inline float rad2deg(float r) {
     return r * 180.0f / M_PI;
 }
 
 //四元数串级 PID
 void attitudeControlStep(
-    const Quaternion& q_target,
-    const Quaternion& q_current,
+    Quaternion& q_target,
+    Quaternion& q_current,
     float gx, float gy, float gz,
     float dt,
     float& u_roll, float& u_pitch, float& u_yaw)
 {
     // 1. 四元数姿态误差
-    Quaternion q_err = q_target * q_current.getConjugate();
+    Quaternion q_err = q_target.getProduct(q_current.getConjugate());
 
     // 2. 姿态误差向量（目标角速度）
     float ex = 2.0f * q_err.x;
     float ey = 2.0f * q_err.y;
     float ez = 2.0f * q_err.z;
 
+    float err_roll_rate = 0.0;
+    float err_pitch_rate = 0.0;
+    float err_yaw_rate  = 0.0;
+
+
     // 3. 角速度误差
     if (easymode_enable){
-        float err_roll_rate  = ex - gx;
-        float err_pitch_rate = ey - gy;
-        float err_yaw_rate   = ez - gz;
-    }else{
+        err_roll_rate  = ex * 5.0f - gx;   //ex的范围在[-2.0, 2.0]之间,要给 ex 乘以一个比例系数。
+        err_pitch_rate = ey * 5.0f - gy;
+        err_yaw_rate   = ez * 5.0f - gz;
+    }else
+    {
         //禁用外环的情况下,角速度误差直接使用摇杆输入
-        float err_roll_rate  = target_roll_rate  - gx;      //target_roll_rate的产生应该有一个系数,后面再加上
-        float err_pitch_rate = target_pitch_rate - gy;
-        float err_yaw_rate   = target_yaw_rate   - gz;
+        float target_roll_rate  = rc_roll  * 8.0f;   //将摇杆输入-1至1乘以一个适当的系数以便和角速度相减
+        float target_pitch_rate = rc_pitch * 8.0f;
+        float target_yaw_rate   = rc_yaw   * 8.0f;
+
+        err_roll_rate  = target_roll_rate  - gx;      // 实际飞行中通常在 0-10 rad/s波动，极限可达±35rad/s
+        err_pitch_rate = target_pitch_rate - gy;
+        err_yaw_rate   = target_yaw_rate   - gz;
     }
     
     
@@ -205,17 +217,17 @@ void attitudeControlStep(
     u_roll = pid_update(err_roll_rate, dt,
                         roll_i, roll_last,
                         0.8f, 0.0f, 0.02f,  //kp,ki,kd
-                        -500.0f, 500.0f);
+                        -300.0f, 300.0f);
 
     u_pitch = pid_update(err_pitch_rate, dt,
                          pitch_i, pitch_last,
                          0.8f, 0.0f, 0.02f,  //kp,ki,kd
-                         -500.0f, 500.0f);
+                         -300.0f, 300.0f);
 
     u_yaw = pid_update(err_yaw_rate, dt,
                        yaw_i, yaw_last,
                        0.6f, 0.0f, 0.00f,  //kp,ki,kd
-                       -500.0f, 500.0f);
+                       -150.0f, 150.0f);
 }
 
 //pid算法
@@ -228,7 +240,7 @@ float pid_update(float err, float dt,
     i_term += err * dt;
 
     // 抗积分饱和
-    if (i_term > out_max) i_term = out_max;
+    if (i_term > out_max) i_term = out_max;     //积分限幅同样使用out_max,其实应设得比输出限幅小一点（如 100-200）
     if (i_term < out_min) i_term = out_min;
 
     // 微分
@@ -263,4 +275,19 @@ Quaternion eulerToQuaternion(float roll, float pitch, float yaw)
     return q;
 }
 
+void motorMix(float throttle,
+              float u_roll, float u_pitch, float u_yaw,
+              float &m1, float &m2, float &m3, float &m4)
+{
+    m1 = throttle - u_roll + u_pitch + u_yaw;  // 右前 CCW
+    m2 = throttle + u_roll + u_pitch - u_yaw;  // 左前 CW
+    m3 = throttle + u_roll - u_pitch + u_yaw;  // 左后 CCW
+    m4 = throttle - u_roll - u_pitch - u_yaw;  // 右后 CW
+
+    // 限幅
+    m1 = constrain(m1, 1000, 2000);
+    m2 = constrain(m2, 1000, 2000);
+    m3 = constrain(m3, 1000, 2000);
+    m4 = constrain(m4, 1000, 2000);
+}
 
