@@ -52,7 +52,7 @@ void setup() {
     delay(1000);
 
     // ESP32-C3 I2C 引脚：SDA=8, SCL=10
-    Wire.begin(18, 19);
+    Wire.begin(8, 10);
     Wire.setClock(400000);
 
     Serial.println("Initializing I2C devices...");
@@ -264,7 +264,7 @@ float pid_update(float err, float dt,
     i_term += err * dt;
 
     // 抗积分饱和
-    if (i_term > out_max/4.0f) i_term = out_max/4.0f;     //积分限幅同
+    if (i_term > out_max/4.0f) i_term = out_max/4.0f;     //积分限幅为pid输出限幅的1/4
     if (i_term < out_min/4.0f) i_term = out_min/4.0f;
 
     // 微分
