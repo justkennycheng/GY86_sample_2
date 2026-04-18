@@ -16,7 +16,6 @@ uint8_t fifoBuffer[64];     // FIFO 缓冲区
 bool easymode_enable = true;   //默认开启PID外环
 
 // 姿态相关（四元数 + YPR）
-Quaternion q_raw;                   // DMP 直接输出
 Quaternion q_current;               // 当前姿态四元数
 Quaternion q_target;               //  目标姿态四元数
 VectorFloat gravity;        // 重力向量
@@ -42,9 +41,6 @@ float rc_roll = 0.0;   // 左右
 float rc_pitch =  0.0;  // 前后
 float rc_yaw =  0.0;    // 偏航
 
-//加速度计校准所需变量
-Quaternion q0;        // 校准时读到的姿态
-Quaternion q_cal;     // 安装补偿四元数
 
 
 ////////////////////////////////////////////////////
@@ -109,9 +105,6 @@ void setup() {
     delay(1000);
     calibrateGyro();  // ⭐ 自动校准
 
-
-
-
 }
 
 void loop() {
@@ -138,9 +131,7 @@ void loop() {
     // 读取一个完整的 DMP 包
     mpu.getFIFOBytes(fifoBuffer, packetSize);
     // 从 DMP 包中解析四元数和重力向量
-    mpu.dmpGetQuaternion(&q_raw, fifoBuffer);
-    q_current = q_raw;
-    //q_current = quatMultiply(q_cal, q_raw);      //用开机初始化时获得姿态q0的共轭q_cal对q_raw进行校正得到q_current.
+    mpu.dmpGetQuaternion(&q_current, fifoBuffer);
     mpu.dmpGetGravity(&gravity, &q_current);
     mpu.dmpGetYawPitchRoll(ypr, &q_current, &gravity);
     // ypr[0] = yaw, ypr[1] = pitch, ypr[2] = roll（单位：弧度）
@@ -155,9 +146,10 @@ void loop() {
     float gy = gy_raw / 16.4f;
     float gz = gz_raw / 16.4f;
     // 转换为 rad/s（推荐）
-    gx *= 0.0174533f + 0.02f;       /////////校准后还是总偏-0.02
+    gx *= 0.0174533f;
     gy *= 0.0174533f;
     gz *= 0.0174533f;
+    gx += 0.02f;       /////////校准后还是总偏-0.02
 
     ///////////根据摇杆输入构造q_target///////////////////////////
     //摇杆输入转四元数
@@ -171,8 +163,8 @@ void loop() {
     q_target = eulerToQuaternion(roll_target, pitch_target, yaw_target);
 
     ///////////进行PID计算得到姿态控制输出////////////////////////
-    float u_roll, u_pitch, u_yaw;
-    attitudeControlStep(q_target, q_current, gx, gy, gz, dt, u_roll, u_pitch, u_yaw);   //得到姿态控制输出u_roll, u_pitch, u_yaw, 这三个值似乎是机体坐标系.
+    float err_pitch_rate, err_roll_rate, err_yaw_rate, u_roll, u_pitch, u_yaw;
+    attitudeControlStep(q_target, q_current, gx, gy, gz, dt, err_pitch_rate, err_roll_rate, err_yaw_rate, u_roll, u_pitch, u_yaw);   //得到姿态控制输出u_roll, u_pitch, u_yaw, 这三个值似乎是机体坐标系.
 
     //电机混控motorMix
     float m1, m2, m3, m4;
@@ -183,14 +175,19 @@ void loop() {
     if (millis() - lastTick > 5) {
         //Serial.printf("dt=%.4fs  YAW=%.2fdeg  PITCH=%.2fdeg  ROLL=%.2fdeg  gx=%.2frad/s  gy=%.2frad/s  gz=%.2frad/s  m1=%.1f m1=%.1f m1=%.1f m1=%.1f\n",
         //      dt, yaw, pitch, roll, gx, gy, gz, m1, m2, m3, m4);
-        //Serial.printf("yaw:%.2f pitch:%.2f roll:%.2f", yaw, pitch, roll);
-        Serial.printf("gx:%.2f gy:%.2f gz:%.2f", gx, gy, gz);
-        //Serial.printf(" m1:%.1f m2=:%.1f m3:%.1f m4:%.1f",m1, m2, m3, m4);
+        //Serial.printf("yaw:%.2f pitch:%.2f roll:%.2f ", yaw, pitch, roll);
+        //Serial.printf("qw:%.5f qx:%.5f qy:%.5f qz:%.5f ",q_current.w, q_current.x, q_current.y, q_current.z);
+        //Serial.printf("gx:%.2f gy:%.2f gz:%.2f ", gx, gy, gz);
+        //Serial.printf("pitch:%.2f roll:%.2f yaw:%.2f gx:%.2f gy:%.2f gz:%.2f m1:%.1f m2=:%.1f m3:%.1f m4:%.1f", pitch, roll, yaw, gx, gy, gz, m1, m2, m3, m4);
+        Serial.printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+             pitch, roll, yaw, gx, gy, gz, err_pitch_rate, err_roll_rate, err_yaw_rate, u_roll, u_pitch, u_yaw, m1, m2, m3, m4);
+        ///
+        //Serial.printf("%.6f %.6f %.6f %.6f",q_current.w, q_current.x, q_current.y, q_current.z);
         lastTick = millis();
     }
     
 
-    Serial.print("\n");
+    //Serial.print("\n");
 }
 
 ////////////////////////////////////////////////////
@@ -205,6 +202,7 @@ void attitudeControlStep(
     Quaternion& q_current,
     float gx, float gy, float gz,
     float dt,
+    float& err_pitch_rate, float& err_roll_rate, float& err_yaw_rate,
     float& u_roll, float& u_pitch, float& u_yaw)
 {
     // 1. 四元数姿态误差
@@ -214,10 +212,10 @@ void attitudeControlStep(
     float ex = 2.0f * q_err.x;  //sin(θ/2) 最大是 1，所以 ex 理论最大可以到 2. 
     float ey = 2.0f * q_err.y;
     float ez = 2.0f * q_err.z;
-    Serial.printf(" ex:%.2f ey:%.2f ez:%.2f",ex, ey, ez);
-    float err_roll_rate = 0.0;
-    float err_pitch_rate = 0.0;
-    float err_yaw_rate  = 0.0;
+    //Serial.printf("%.4f,%.4f,%.4f ",ex, ey, ez);
+    err_roll_rate = 0.0;
+    err_pitch_rate = 0.0;
+    err_yaw_rate  = 0.0;
 
 
     // 3. 角速度误差
@@ -229,15 +227,15 @@ void attitudeControlStep(
     }else
     {
         //禁用外环的情况下,角速度误差直接使用摇杆输入
-        float target_roll_rate  = rc_roll  * 8.0f;   //将摇杆输入-1至1乘以一个适当的系数以便和角速度相减
-        float target_pitch_rate = rc_pitch * 8.0f;
-        float target_yaw_rate   = rc_yaw   * 8.0f;
+        float target_roll_rate  = rc_roll  * 7.0f;   //将摇杆输入(-1至1)乘以一个适当的系数以便和角速度相减
+        float target_pitch_rate = rc_pitch * 7.0f;
+        float target_yaw_rate   = rc_yaw   * 7.0f;
 
         err_roll_rate  = target_roll_rate  - gx;      // 实际飞行中通常在 0-10 rad/s波动，极限可达±35rad/s
         err_pitch_rate = target_pitch_rate - gy;
         err_yaw_rate   = target_yaw_rate   - gz;
     }
-    //Serial.printf("err_roll_rate=%.1f err_pitch_rate=%.1f err_yaw_rate=%.1f\n",err_roll_rate, err_pitch_rate, err_yaw_rate);
+    //Serial.printf("%.4f,%.1f,%.1f\n",err_roll_rate, err_pitch_rate, err_yaw_rate);
     
     // 4. Rate PID（函数版）
     u_roll = pid_update(err_roll_rate, dt,
@@ -266,8 +264,8 @@ float pid_update(float err, float dt,
     i_term += err * dt;
 
     // 抗积分饱和
-    if (i_term > out_max) i_term = out_max;     //积分限幅同样使用out_max,其实应设得比输出限幅小一点（如 100-200）
-    if (i_term < out_min) i_term = out_min;
+    if (i_term > out_max/4.0f) i_term = out_max/4.0f;     //积分限幅同
+    if (i_term < out_min/4.0f) i_term = out_min/4.0f;
 
     // 微分
     float d = (err - last_err) / dt;
@@ -334,32 +332,6 @@ void calibrateGyro() {
     Serial.print(gx_offset); Serial.print(", ");
     Serial.print(gy_offset); Serial.print(", ");
     Serial.println(gz_offset);
-}
-
-//加速度校平. 产生偏差四元数.
-void calibrateLevelQuat() {
-    // 这里假设 fifoBuffer 里已经有一帧最新的 DMP 数据
-    mpu.dmpGetQuaternion(&q0, fifoBuffer);
-
-    // q_cal = q0 的共轭（对单位四元数来说，共轭 = 逆）
-    q_cal = Quaternion(q0.w, -q0.x, -q0.y, -q0.z);
-
-    Serial.println("Quaternion level calibration done.");
-    Serial.print("q0 = ");
-    Serial.print(q0.w); Serial.print(", ");
-    Serial.print(q0.x); Serial.print(", ");
-    Serial.print(q0.y); Serial.print(", ");
-    Serial.println(q0.z);
-}
-
-//四元数做共轭运算
-Quaternion quatMultiply(const Quaternion& a, const Quaternion& b) {
-    return Quaternion(
-        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z,
-        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
-        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
-        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w
-    );
 }
 
 
